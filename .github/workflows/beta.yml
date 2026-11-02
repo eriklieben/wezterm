@@ -1,0 +1,144 @@
+# Keeps the `beta` branch at current WezTerm plus wezterm/wezterm#7924, and publishes a build.
+#
+# `beta` is rebuilt from scratch each run, so it is always upstream's main with two commits on
+# top: this workflow, and the PR as one commit. Pushing needs the BETA_DEPLOY_KEY deploy key,
+# because the default token may not push commits that change workflow files, and upstream's do.
+name: beta
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if nothing changed"
+        type: boolean
+        default: false
+
+concurrency:
+  group: beta
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/wezterm/wezterm.git
+  PR: "7924"
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.rebuild.outputs.changed }}
+      sha: ${{ steps.rebuild.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: beta
+          fetch-depth: 0
+          ssh-key: ${{ secrets.BETA_DEPLOY_KEY }}
+      - name: Rebuild the branch on current WezTerm
+        id: rebuild
+        env:
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main "refs/pull/$PR/head:refs/remotes/upstream/pr"
+
+          # Stop for a person if the PR has landed upstream: this fork has done its job.
+          if [ "$(gh pr view "$PR" -R wezterm/wezterm --json state --jq .state)" = "MERGED" ]; then
+            echo "::error::WezTerm's pull request $PR is merged; this fork is no longer needed."
+            exit 1
+          fi
+
+          cp .github/workflows/beta.yml "$RUNNER_TEMP/beta.yml"
+          previous=$(git rev-parse HEAD)
+
+          git checkout -q -B next upstream/main
+          git rm -r -q --ignore-unmatch .github/workflows
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/beta.yml" .github/workflows/beta.yml
+          git add .github/workflows
+          git commit -q -m "ci: build the beta from current WezTerm and the image PR"
+
+          if ! git merge --squash --no-commit upstream/pr; then
+            echo "::error::wezterm/wezterm#$PR no longer merges cleanly onto WezTerm main."
+            git status --short | grep -E '^(UU|AA|DD|U.|.U)' || true
+            exit 1
+          fi
+          # The message is written here so that the PR's own commit trailers aren't carried over.
+          # It names the PR in plain words on purpose: a link or a "#number" here would add a
+          # cross-reference to the upstream PR's timeline on every rebuild.
+          git commit -q -F - <<EOF
+          feat(term): support kitty graphics protocol unicode placeholders
+
+          The changes of WezTerm's pull request $PR as one commit,
+          at $(git rev-parse --short=12 upstream/pr).
+
+          Written by sjuxax, with placement ID handling by cremarch.
+          EOF
+
+          if git diff --quiet "$previous" HEAD && [ "$FORCE" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing changed."
+            exit 0
+          fi
+          git diff --quiet "$previous" HEAD || git push --force origin HEAD:beta
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          env CI=yes PATH="$PATH" ./get-deps
+      - name: Build
+        run: cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+      - name: Test the terminal model, where the PR's changes and tests are
+        run: cargo test --release -p wezterm-term -p wezterm-cell
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version=$(git show -s --format=%cd-%h --abbrev=8 --date=format:%Y%m%d-%H%M%S HEAD)
+          mkdir -p dist/wezterm-beta/bin
+          for bin in wezterm wezterm-gui wezterm-mux-server strip-ansi-escapes; do
+            install -m755 "target/release/$bin" dist/wezterm-beta/bin/
+          done
+          echo "$version" > dist/wezterm-beta/VERSION
+          tar -C dist -cJf wezterm-beta-linux-x86_64.tar.xz wezterm-beta
+          sha256sum wezterm-beta-linux-x86_64.tar.xz > wezterm-beta-linux-x86_64.tar.xz.sha256
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release delete beta --cleanup-tag --yes || true
+          gh release create beta \
+            --target "$SHA" \
+            --prerelease \
+            --title "WezTerm beta $VERSION" \
+            --notes "Current WezTerm with its pull request $PR applied. Personal build, unsupported." \
+            wezterm-beta-linux-x86_64.tar.xz \
+            wezterm-beta-linux-x86_64.tar.xz.sha256
+        shell: bash
